@@ -1,17 +1,25 @@
-# --- 核心 Web 框架 ---
-fastapi==0.115.12
-uvicorn==0.30.6
+# Web Frameworks
+fastapi
+uvicorn
+streamlit
+requests
+python-multipart
 
-# --- LangChain 与 AI 相关 ---
-langchain==1.2.12
-langchain-openai==1.1.11
-langchain-community==0.4.1
-langchain-chroma==1.1.0
-langchain-text-splitters==1.1.1
+# AI & LangChain
+langchain
+langchain-openai
+langchain-community
+langchain-chroma
+langchain-text-splitters
+pydantic
+python-dotenv
 
-# --- 工具与数据库 ---
-pydantic==2.13.1
-python-dotenv==1.0.1
-chromadb==1.5.5
-tavily-python==0.5.0
-pypdf==4.2.0
+# Data Processing
+pypdf
+beautifulsoup4
+
+# Search Engine
+tavily-python
+
+# Vector DB Helper
+chromadb

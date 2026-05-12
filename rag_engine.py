@@ -1,204 +1,271 @@
 import os
-import time
 from typing import List, Generator, Tuple
-from pydantic import BaseModel, Field
 from dotenv import load_dotenv
 
-# FastAPI 框架组件
-from fastapi import FastAPI, HTTPException
-from fastapi.responses import StreamingResponse
-from fastapi.middleware.cors import CORSMiddleware
-
-# LangChain 核心组件
+# LangChain Core Components
 from langchain_openai import ChatOpenAI, OpenAIEmbeddings
 from langchain_chroma import Chroma
 from langchain_community.document_loaders import PyPDFLoader, WebBaseLoader
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
 from langchain_community.chat_message_histories import ChatMessageHistory
-from tavily import TavilyClient
 
-# --- 1. 环境与基础配置 ---
+# --- 1. Environment and Basic Configuration ---
 load_dotenv()
-TAVILY_API_KEY = os.getenv("TAVILY_API_KEY")
 PERSIST_DIR = os.getenv("PERSIST_DIRECTORY", "./data/chroma_db")
 
-app = FastAPI(title="SCCCI Ultimate RAG Agent")
 
-# 跨域配置 (如果你有前端页面，这必不可少)
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
-# --- 2. API 数据模型 (严格定义) ---
-class QueryRequest(BaseModel):
-    question: str
-
-class QueryResponse(BaseModel):
-    answer: str
-    topic: str
-    sources: List[str]
-
-class IngestPDFRequest(BaseModel):
-    file_path: str  # 这里的路径必须是服务器本地可访问的
-
-class IngestURLRequest(BaseModel):
-    url: str
-
-# --- 3. RAG 核心引擎类 ---
+# --- 2. RAG Core Engine Class ---
 class RAGEngine:
     def __init__(self):
-        print("🛠️ [SYSTEM] 正在启动全功能引擎：支持 Memory + Rerank + WebAgent + Ingestion")
+        # Startup log in English
+        print("🛠️ [SYSTEM] Starting Engine: Memory + MMR Rerank + Source Tracking enabled")
         self.embeddings = OpenAIEmbeddings(model="text-embedding-3-small")
         self.vector_store = Chroma(
-            persist_directory=PERSIST_DIR, 
+            persist_directory=PERSIST_DIR,
             embedding_function=self.embeddings
         )
-        self.retriever = self.vector_store.as_retriever(search_kwargs={"k": 5})
-        
-        # 决策与分析模型 (非流式，确保逻辑稳定)
+
+        # MMR (Maximal Marginal Relevance) reduces redundant chunks and improves diversity
+        self.retriever = self.vector_store.as_retriever(
+            search_type="mmr",
+            search_kwargs={"k": 5, "fetch_k": 20, "lambda_mult": 0.6}
+        )
+
+        # Planner: used for query rewriting and topic classification (non-streaming)
         self.planner = ChatOpenAI(model="gpt-4o-mini", temperature=0)
-        # 交互与输出模型 (流式，提升用户体验)
+        # Main LLM: used for final answer generation
         self.llm = ChatOpenAI(model="gpt-4o-mini", temperature=0, streaming=True)
-        
-        # 关键：持久化对话记忆
+
+        # Persistent conversation memory
         self.memory = ChatMessageHistory()
-        self.tavily = TavilyClient(api_key=TAVILY_API_KEY)
         self.splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=150)
 
+    # ------------------------------------------------------------------
+    # Query Rewriting
+    # ------------------------------------------------------------------
     def _rewrite_query(self, question: str) -> str:
-        """【意图对齐】利用记忆补全模糊问题"""
+        """Rewrite ambiguous questions using recent conversation history."""
         if not self.memory.messages:
             return question
-        
-        history_snippet = "\n".join([f"{m.type}: {m.content}" for m in self.memory.messages[-2:]])
-        prompt = f"""根据以下对话历史，将用户的新问题改写为一个独立且完整的搜索词。
-        
-        历史对话:
-        {history_snippet}
-        
-        新问题: {question}
-        
-        只需输出改写后的文本，不要任何解释。"""
-        
-        refined = self.planner.invoke(prompt).content
+
+        history_snippet = "\n".join(
+            [f"{m.type}: {m.content}" for m in self.memory.messages[-4:]]
+        )
+        # Prompt translated to English for logic consistency
+        prompt = (
+            f"Based on the following conversation history, rewrite the user's new question into a standalone and complete search term.\n\n"
+            f"Conversation History:\n{history_snippet}\n\n"
+            f"New Question: {question}\n\n"
+            f"Output only the rewritten text without any explanation."
+        )
+        refined = self.planner.invoke(prompt).content.strip()
+        print(f"🔍 [LOG] Intent Rewriting Result: {refined}")
         return refined
 
+    # ------------------------------------------------------------------
+    # Topic Classification
+    # ------------------------------------------------------------------
+    def _classify_topic(self, question: str, context: str) -> str:
+        """Classify the topic of the answer based on question and retrieved context."""
+        prompt = (
+            f"Based on the question and references, summarize the topic in 2–4 English words (e.g., Product Info, Tech Support, Pricing, History).\n\n"
+            f"Question: {question}\n"
+            f"Context Summary: {context[:500]}\n\n"
+            f"Output only the topic category words."
+        )
+        topic = self.planner.invoke(prompt).content.strip()
+        return topic if topic else "General"
+
+    # ------------------------------------------------------------------
+    # Source Extraction
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _extract_sources(docs) -> List[str]:
+        """Extract unique source filenames/URLs from retrieved documents."""
+        seen = set()
+        sources = []
+        for doc in docs:
+            src = doc.metadata.get("source", "Unknown")
+            if src not in seen:
+                seen.add(src)
+                sources.append(src)
+        return sources
+
+    # ------------------------------------------------------------------
+    # Main Query Interface (sync, used by FastAPI /query)
+    # ------------------------------------------------------------------
     def query(self, question: str) -> Tuple[str, str, List[str]]:
-        """【同步接口适配器】解决调用时的 AttributeError"""
-        full_text = ""
-        for chunk in self.stream_query(question):
-            # 过滤掉系统内部提示标签
-            if not chunk.startswith("💡") and not chunk.startswith("🌐"):
-                full_text += chunk
-        return full_text, "General", ["Hybrid Retrieval (Local Vector + Tavily Web)"]
+        """Synchronous query: returns (answer, topic, sources)."""
+        print(f"\n🚀 [LOG] Received request: {question}")
 
-    def stream_query(self, question: str) -> Generator[str, None, None]:
-        """【流式核心逻辑】含完整日志输出"""
-        print(f"\n🚀 [LOG] 收到用户请求: {question}")
-        
-        # 1. 意图重构
+        # 1. Query rewriting
         refined_q = self._rewrite_query(question)
-        print(f"🔍 [LOG] 意图改写结果: {refined_q}")
 
-        # 2. 本地检索
+        # 2. Local vector retrieval (MMR)
         docs = self.retriever.invoke(refined_q)
+        print(f"📚 [LOG] Retrieval complete, chunks recalled: {len(docs)}")
+
+        # 3. If nothing retrieved, respond honestly
+        if not docs:
+            answer = "I'm sorry, I couldn't find any information related to this question in the knowledge base. Please upload relevant PDFs or URLs first."
+            self.memory.add_user_message(question)
+            self.memory.add_ai_message(answer)
+            return answer, "No relevant data", []
+
         local_context = "\n\n".join([d.page_content for d in docs])
-        print(f"📚 [LOG] 本地检索完成，召回片段: {len(docs)}")
+        sources = self._extract_sources(docs)
 
-        # 3. 动态联网判定
-        check_prompt = f"问题: {refined_q}\n现有资料: {local_context}\n如果无法准确回答，请仅输出 NEED_SEARCH，否则输出 OK。"
-        decision = self.planner.invoke(check_prompt).content
-        
-        final_context = local_context
-        if "NEED_SEARCH" in decision:
-            print(f"⚠️ [LOG] 本地库覆盖不足，正在启动 Tavily 搜刮全网信息...")
-            yield "💡 正在连接 Tavily 获取实时动态...\n\n"
-            
-            web_data = self.tavily.search(query=refined_q, max_results=3, search_depth="basic")
-            final_context = "\n\n".join([f"来源:{r['url']}\n内容:{r['content']}" for r in web_data['results']])
-            print(f"🌐 [LOG] 联网数据获取成功。")
-        else:
-            print(f"✅ [LOG] 本地知识库足以支撑回答。")
+        # 4. Confidence check
+        check_prompt = (
+            f"You are a strict knowledge base assistant. Here is the retrieved context:\n{local_context}\n\n"
+            f"User Question: {question}\n\n"
+            f"Does the context provide enough information to answer the question? Answer only YES or NO."
+        )
+        decision = self.planner.invoke(check_prompt).content.strip().upper()
 
-        # 4. 组装最终 Prompt 并流式输出
+        if "NO" in decision:
+            answer = (
+                "I'm sorry, I cannot accurately answer this question based on the current knowledge base. "
+                "Please try uploading more relevant materials."
+            )
+            self.memory.add_user_message(question)
+            self.memory.add_ai_message(answer)
+            return answer, "Insufficient Coverage", sources
+
+        # 5. Build prompt and generate answer
         prompt = ChatPromptTemplate.from_messages([
-            ("system", "你是一个专业分析助手。请严格基于提供的资料和对话历史进行回答。"),
+            (
+                "system",
+                "You are a professional knowledge base assistant. "
+                "Strictly use the provided [Context] to answer the question. "
+                "If the information is not in the context, say 'Information not mentioned'. "
+                "Be concise and accurate. Use English for the response."
+            ),
             MessagesPlaceholder(variable_name="history"),
-            ("human", "【参考资料】:\n{context}\n\n【用户问题】: {question}")
+            ("human", "[Context]:\n{context}\n\n[User Question]: {question}")
         ])
-        
+
         formatted_messages = prompt.format_messages(
-            context=final_context, 
-            question=question, 
+            context=local_context,
+            question=question,
             history=self.memory.messages
         )
 
-        print(f"✍️ [LOG] 开始生成流式回答...")
+        print("✍️ [LOG] Generating answer...")
+        answer_chunks = []
+        for chunk in self.llm.stream(formatted_messages):
+            answer_chunks.append(chunk.content)
+        answer = "".join(answer_chunks)
+
+        # 6. Classify topic
+        topic = self._classify_topic(question, local_context)
+
+        # 7. Update memory
+        self.memory.add_user_message(question)
+        self.memory.add_ai_message(answer)
+        print(f"💾 [LOG] Memory synced. Session complete. Topic: {topic}\n")
+
+        return answer, topic, sources
+
+    # ------------------------------------------------------------------
+    # Streaming Query Interface (used by /query_stream)
+    # ------------------------------------------------------------------
+    def stream_query(self, question: str) -> Generator[str, None, None]:
+        """Streaming query: yields answer tokens one by one."""
+        print(f"\n🚀 [LOG] Received streaming request: {question}")
+
+        refined_q = self._rewrite_query(question)
+        docs = self.retriever.invoke(refined_q)
+        print(f"📚 [LOG] Retrieval complete, chunks recalled: {len(docs)}")
+
+        if not docs:
+            msg = "I'm sorry, I couldn't find any information related to this question in the knowledge base."
+            self.memory.add_user_message(question)
+            self.memory.add_ai_message(msg)
+            yield msg
+            return
+
+        local_context = "\n\n".join([d.page_content for d in docs])
+
+        prompt = ChatPromptTemplate.from_messages([
+            (
+                "system",
+                "You are a professional knowledge base assistant. "
+                "Strictly use the provided [Context] to answer. "
+                "If not found, say 'Information not mentioned'. Use English."
+            ),
+            MessagesPlaceholder(variable_name="history"),
+            ("human", "[Context]:\n{context}\n\n[User Question]: {question}")
+        ])
+
+        formatted_messages = prompt.format_messages(
+            context=local_context,
+            question=question,
+            history=self.memory.messages
+        )
+
         accumulated_answer = ""
         for chunk in self.llm.stream(formatted_messages):
             token = chunk.content
             accumulated_answer += token
             yield token
-        
-        # 5. 更新记忆
+
         self.memory.add_user_message(question)
         self.memory.add_ai_message(accumulated_answer)
-        print(f"💾 [LOG] 记忆已同步，本轮对话完成。\n")
+        print("💾 [LOG] Streaming memory synced.\n")
 
-    # --- 数据导入方法集 ---
+    # ------------------------------------------------------------------
+    # Knowledge Base Management
+    # ------------------------------------------------------------------
     def ingest_pdf(self, path: str) -> int:
-        print(f"📄 [SYSTEM] 正在解析 PDF: {path}")
+        """Load a PDF, split into chunks, and add to the vector store."""
+        print(f"📄 [SYSTEM] Parsing PDF: {path}")
         loader = PyPDFLoader(path)
         documents = loader.load_and_split(self.splitter)
+        # Normalize source metadata
+        for doc in documents:
+            doc.metadata["source"] = os.path.basename(path)
         self.vector_store.add_documents(documents)
+        print(f"✅ [SYSTEM] PDF Ingestion complete. {len(documents)} chunks added.")
         return len(documents)
 
     def ingest_url(self, url: str) -> int:
-        print(f"🔗 [SYSTEM] 正在抓取 URL: {url}")
+        """Scrape a URL, split into chunks, and add to the vector store."""
+        print(f"🔗 [SYSTEM] Scraping URL: {url}")
         loader = WebBaseLoader(url)
         documents = loader.load_and_split(self.splitter)
+        for doc in documents:
+            doc.metadata["source"] = url
         self.vector_store.add_documents(documents)
+        print(f"✅ [SYSTEM] URL Ingestion complete. {len(documents)} chunks added.")
         return len(documents)
 
-# --- 4. FastAPI 路由定义 (确保路径与你之前的调用习惯一致) ---
-engine = RAGEngine()
+    def list_sources(self) -> List[str]:
+        """Return a deduplicated list of all ingested sources."""
+        try:
+            all_docs = self.vector_store.get()
+            metadatas = all_docs.get("metadatas", [])
+            sources = list({m.get("source", "Unknown") for m in metadatas if m})
+            return sorted(sources)
+        except Exception as e:
+            print(f"❌ [ERROR] Failed to list sources: {e}")
+            return []
 
-@app.post("/query")
-async def ask_ai_json(request: QueryRequest):
-    """支持传统的 POST JSON 响应"""
-    ans, topic, src = engine.query(request.question)
-    return QueryResponse(answer=ans, topic=topic, sources=src)
-
-@app.post("/query_stream")
-async def ask_ai_stream(request: QueryRequest):
-    """支持流式响应 (text/plain)"""
-    return StreamingResponse(engine.stream_query(request.question), media_type="text/plain")
-
-@app.post("/admin/ingest-pdf")
-async def admin_ingest_pdf(request: IngestPDFRequest):
-    """PDF 导入接口"""
-    try:
-        count = engine.ingest_pdf(request.file_path)
-        return {"status": "success", "chunks_ingested": count}
-    except Exception as e:
-        print(f"❌ [ERROR] PDF 导入失败: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
-
-@app.post("/admin/ingest-url")
-async def admin_ingest_url(request: IngestURLRequest):
-    """URL 导入接口"""
-    try:
-        count = engine.ingest_url(request.url)
-        return {"status": "success", "chunks_ingested": count}
-    except Exception as e:
-        print(f"❌ [ERROR] URL 导入失败: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
-
-if __name__ == "__main__":
-    import uvicorn
-    # 直接运行: python main.py
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    def delete_source(self, source_path: str) -> Tuple[bool, str]:
+        """Delete all chunks belonging to a specific source from the vector store."""
+        try:
+            all_docs = self.vector_store.get()
+            ids_to_delete = [
+                doc_id
+                for doc_id, meta in zip(all_docs["ids"], all_docs["metadatas"])
+                if meta.get("source") == source_path
+            ]
+            if not ids_to_delete:
+                return False, f"Source not found: {source_path}"
+            self.vector_store.delete(ids=ids_to_delete)
+            print(f"🗑️ [SYSTEM] Deleted source '{source_path}', removed {len(ids_to_delete)} chunks.")
+            return True, f"Successfully deleted {len(ids_to_delete)} chunks (Source: {source_path})"
+        except Exception as e:
+            print(f"❌ [ERROR] Deletion failed: {e}")
+            return False, str(e)

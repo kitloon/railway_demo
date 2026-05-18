@@ -18,9 +18,20 @@ PERSIST_DIR = os.getenv("PERSIST_DIRECTORY", "./data/chroma_db")
 # --- 2. RAG Core Engine Class ---
 class RAGEngine:
     def __init__(self):
-        # Startup log in English
         print("🛠️ [SYSTEM] Starting Engine: Memory + MMR Rerank + Source Tracking enabled")
-        self.embeddings = OpenAIEmbeddings(model="text-embedding-3-small")
+        
+        # 尝试从环境变量获取 Key
+        api_key = os.getenv("OPENAI_API_KEY")
+        
+        # 如果获取不到，抛出一个更有意义的错误
+        if not api_key:
+            raise ValueError("❌ 错误: 未能在环境变量中找到 OPENAI_API_KEY。请检查 Railway 的 Variables 配置。")
+
+        # 显式传入 api_key
+        self.embeddings = OpenAIEmbeddings(
+            model="text-embedding-3-small",
+            openai_api_key=api_key
+        )
         self.vector_store = Chroma(
             persist_directory=PERSIST_DIR,
             embedding_function=self.embeddings
@@ -33,9 +44,9 @@ class RAGEngine:
         )
 
         # Planner: used for query rewriting and topic classification (non-streaming)
-        self.planner = ChatOpenAI(model="gpt-4o-mini", temperature=0)
+        self.planner = ChatOpenAI(model="gpt-4o-mini", temperature=0, openai_api_key=api_key)
         # Main LLM: used for final answer generation
-        self.llm = ChatOpenAI(model="gpt-4o-mini", temperature=0, streaming=True)
+        self.llm = ChatOpenAI(model="gpt-4o-mini", temperature=0, streaming=True, openai_api_key=api_key)
 
         # Persistent conversation memory
         self.memory = ChatMessageHistory()

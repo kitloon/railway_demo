@@ -20,12 +20,20 @@ class RAGEngine:
     def __init__(self):
         print("🛠️ [SYSTEM] Starting Engine: Memory + MMR Rerank + Source Tracking enabled")
         
-        # 尝试从环境变量获取 Key
+        # 🟢 【新增调试代码】打印出当前容器能看到的所有变量名，抓出内鬼
+        print("📋 [DEBUG] 容器内所有可用的环境变量列表（Keys）:")
+        print(list(os.environ.keys()))
+        
         api_key = os.getenv("OPENAI_API_KEY")
         
-        # 如果获取不到，抛出一个更有意义的错误
+        # 🟢 【新增调试代码】顺便看看是不是名字带了空格
+        if api_key:
+            print(f"🔍 [DEBUG] 成功获取到 Key，长度为: {len(api_key)}，开头前4位: {api_key[:4]}")
+        else:
+            print("❌ [DEBUG] os.getenv('OPENAI_API_KEY') 返回了 None！")
+
         if not api_key:
-            raise ValueError("❌ 错误: 未能在环境变量中找到 OPENAI_API_KEY。请检查 Railway 的 Variables 配置。")
+            raise ValueError("❌ 错误: 未能在环境变量中找到 OPENAI_API_KEY。请检查上方打印的列表里有没有它。")
 
         # 显式传入 api_key
         self.embeddings = OpenAIEmbeddings(
